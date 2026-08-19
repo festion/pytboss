@@ -124,6 +124,7 @@ class PitBoss:
         self._state = StateDict()
         self._last_uptime: float | None = None
         self._last_uptime_check: float = 0.0
+        self._uptime_unsupported: bool = False
 
     def is_connected(self) -> bool:
         """Returns whether we are actively connected to the grill."""
@@ -675,8 +676,33 @@ class PitBoss:
         :meta private:
         """
         now = monotonic()
+        if self._uptime_unsupported:
+            return 0.0
         if self._last_uptime is None or now - self._last_uptime_check > _UPTIME_TTL:
-            result = as_dict(await self._conn.send_command("PB.GetTime", {}))
+            try:
+                result = as_dict(await self._conn.send_command("PB.GetTime", {}))
+            except RPCError as ex:
+                if ex.code != METHOD_NOT_FOUND_CODE:
+                    raise
+                # Not every control board serves `PB.GetTime`; measured absent
+                # on a PB1250CS running firmware 0.2.3, whose `RPC.List`
+                # reports 52 methods without it while `PB.GetState` answers
+                # normally. Unguarded, the 404 propagates out of every
+                # authenticated command, because `_authenticate` calls this
+                # for each one whenever a password is set.
+                #
+                # Latched rather than re-probed: the answer cannot change for
+                # the life of the connection, and re-learning it would cost a
+                # round trip per authenticated command -- the same waste #512
+                # removed from the success path.
+                #
+                # 0.0 is safe on precisely the firmware that gets here: uptime
+                # feeds only `timed_key`, and boards predating the
+                # `checkPassword` handler ignore `psw` entirely. Boards that
+                # do check it serve `PB.GetTime`, so they never take this path.
+                _LOGGER.debug("Grill does not serve PB.GetTime: %s", ex)
+                self._uptime_unsupported = True
+                return 0.0
             uptime = result.get("time")
             if not isinstance(uptime, (int, float)):
                 # Not cached, because caching it is worse than not having it:

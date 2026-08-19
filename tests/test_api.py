@@ -1455,3 +1455,53 @@ async def test_one_raising_vdata_subscriber_does_not_starve_the_rest():
     await pitboss._on_vdata_received({"p1T": 165})
 
     assert seen == ["bad", "good"]
+
+
+async def test_get_uptime_when_the_grill_does_not_serve_pb_gettime():
+    """404 degrades to 0.0 instead of escaping into every authenticated call.
+
+    `_authenticate` calls `get_uptime` for every command when a password is
+    set, so an unguarded 404 here does not merely lose the uptime -- it fails
+    `PB.GetState`, the coordinator's first refresh, and the config entry with
+    `No handler for PB.GetTime`. Measured on a PB1250CS on firmware 0.2.3,
+    whose `RPC.List` reports 52 methods without `PB.GetTime` while
+    `PB.GetState` answers normally.
+    """
+    conn = FakeTransport()
+    # A password is what makes this reachable at all: `_authenticate` only
+    # calls `get_uptime` when one is set.
+    pitboss = api.PitBoss(conn, "PBV4PS2", "hunter2")
+    await pitboss.start()
+    with mock.patch.object(
+        conn,
+        "send_command",
+        AsyncMock(side_effect=RPCError("No handler for PB.GetTime", 404)),
+    ) as send:
+        assert await pitboss.get_uptime() == 0.0
+        # Latched: the verdict cannot change for the life of the connection,
+        # so a second call must not re-pay the round trip. Without this the
+        # guard is correct and still costs one 404 per authenticated command.
+        assert await pitboss.get_uptime() == 0.0
+        assert send.await_count == 1
+
+    # And authentication now completes rather than raising.
+    assert "psw" in await pitboss._authenticate({})
+
+
+async def test_get_uptime_does_not_swallow_a_non_404_failure():
+    """The arm that lets the test above mean something.
+
+    A guard keyed on the exception TYPE rather than its code would make every
+    transport error read as "this grill has no clock", and the caller would
+    get a plausible 0.0 instead of a fault.
+    """
+    conn = FakeTransport()
+    pitboss = api.PitBoss(conn, "PBV4PS2")
+    await pitboss.start()
+    with (
+        mock.patch.object(
+            conn, "send_command", AsyncMock(side_effect=RPCError("boom", -1))
+        ),
+        pytest.raises(RPCError),
+    ):
+        await pitboss.get_uptime()
